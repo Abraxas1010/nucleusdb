@@ -1,0 +1,178 @@
+use nucleusdb::persistence::{
+    default_wal_path, init_wal, load_wal, persist_snapshot_and_sync_wal, save_snapshot,
+    truncate_wal,
+};
+use nucleusdb::protocol::{NucleusDb, VcBackend};
+use nucleusdb::sql::executor::SqlExecutor;
+use nucleusdb::state::{Delta, State};
+use nucleusdb::witness::WitnessConfig;
+use redb::{Database, TableDefinition};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const WAL_META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("nucleusdb_wal_meta");
+const WAL_EVENTS_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("nucleusdb_wal_events");
+const WAL_META_KEY: &str = "meta";
+
+fn mk_cfg() -> WitnessConfig {
+    WitnessConfig::with_generated_keys(2, vec!["w1".into(), "w2".into(), "w3".into()])
+}
+
+#[test]
+fn init_wal_accepts_legacy_meta_without_keymap_field() {
+    let db = NucleusDb::new(State::new(vec![10, 20]), VcBackend::BinaryMerkle, mk_cfg());
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let wal_path = std::env::temp_dir().join(format!("nucleusdb_wal_legacy_meta_{stamp}.redb"));
+
+    {
+        let database = Database::create(&wal_path).expect("create wal db");
+        let wtx = database.begin_write().expect("begin write");
+        {
+            let mut meta = wtx.open_table(WAL_META_TABLE).expect("meta table");
+            let _events = wtx.open_table(WAL_EVENTS_TABLE).expect("events table");
+            // Simulate Phase 1 metadata payload where `keymap` did not exist.
+            let legacy_meta = serde_json::json!({
+                "schema": "nucleusdb/persistence-wal-meta/v1",
+                "backend": db.backend.clone(),
+                "security_params": db.security_params.clone(),
+                "reduction_contracts": db.reduction_contracts.clone(),
+                "kzg_trusted_setup": db.kzg_trusted_setup.clone(),
+                "initial_state": db.state.clone()
+            });
+            let raw = serde_json::to_vec(&legacy_meta).expect("serialize");
+            meta.insert(WAL_META_KEY, raw.as_slice())
+                .expect("insert meta");
+        }
+        wtx.commit().expect("commit legacy wal");
+    }
+
+    init_wal(&wal_path, &db).expect("legacy wal metadata should be accepted");
+    let recovered = load_wal(&wal_path, mk_cfg()).expect("load wal");
+    assert_eq!(recovered.state.values, db.state.values);
+    assert!(recovered.keymap.is_empty());
+}
+
+#[test]
+fn snapshot_sync_keeps_wal_compatible_with_current_snapshot_state() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let snapshot_path = std::env::temp_dir().join(format!("nucleusdb_snapshot_sync_{stamp}.redb"));
+    let wal_path = default_wal_path(&snapshot_path);
+
+    let mut db = NucleusDb::new(State::new(vec![]), VcBackend::BinaryMerkle, mk_cfg());
+    db.save_persistent(&snapshot_path).expect("save snapshot");
+    init_wal(&wal_path, &db).expect("init wal");
+
+    db.keymap.get_or_create("alpha");
+    db.commit(Delta::new(vec![(0, 42)]), &[])
+        .expect("commit should succeed");
+    persist_snapshot_and_sync_wal(&snapshot_path, &wal_path, &db).expect("snapshot+wal sync");
+
+    // If WAL metadata diverged from snapshot state, this would fail with WalMetaMismatch.
+    let loaded_snapshot =
+        NucleusDb::load_persistent(&snapshot_path, mk_cfg()).expect("load snapshot");
+    init_wal(&wal_path, &loaded_snapshot).expect("wal should match snapshot state");
+}
+
+// --- Bug #1 regression test: WAL/snapshot sync after commit ---
+
+#[test]
+fn snapshot_then_wal_init_succeeds_after_truncate() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let db_path = std::env::temp_dir().join(format!("nucleusdb_wal_sync_bug1_{stamp}.redb"));
+    let wal_path = default_wal_path(&db_path);
+
+    // Create db and init WAL.
+    let mut db = NucleusDb::new(State::new(vec![]), VcBackend::BinaryMerkle, mk_cfg());
+    save_snapshot(&db_path, &db).expect("save initial snapshot");
+    init_wal(&wal_path, &db).expect("init WAL");
+
+    // Simulate INSERT + COMMIT via SQL executor.
+    {
+        let mut exec = SqlExecutor::new(&mut db);
+        exec.execute("INSERT INTO data (key, value) VALUES ('x', 42);");
+        exec.execute("COMMIT;");
+        assert!(exec.committed());
+    }
+
+    // Save snapshot AND truncate WAL (the fix).
+    save_snapshot(&db_path, &db).expect("save updated snapshot");
+    truncate_wal(&wal_path, &db).expect("truncate WAL to match");
+
+    // Now init_wal must succeed — this previously failed with WalMetaMismatch
+    // because the old WAL had stale initial_state.
+    init_wal(&wal_path, &db).expect("init_wal after truncate must succeed");
+
+    // Verify data survived.
+    let recovered = NucleusDb::load_persistent(&db_path, mk_cfg()).expect("load snapshot");
+    assert_eq!(recovered.keymap.get("x"), Some(0));
+    let (value, proof, root) = recovered.query(0).expect("query");
+    assert_eq!(value, 42);
+    assert!(recovered.verify_query(0, value, &proof, root));
+}
+
+#[test]
+fn snapshot_without_wal_truncate_causes_mismatch() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let db_path = std::env::temp_dir().join(format!("nucleusdb_wal_nosync_bug1_{stamp}.redb"));
+    let wal_path = default_wal_path(&db_path);
+
+    let mut db = NucleusDb::new(State::new(vec![]), VcBackend::BinaryMerkle, mk_cfg());
+    save_snapshot(&db_path, &db).expect("save initial");
+    init_wal(&wal_path, &db).expect("init WAL");
+
+    // Mutate state.
+    {
+        let mut exec = SqlExecutor::new(&mut db);
+        exec.execute("INSERT INTO data (key, value) VALUES ('y', 99);");
+        exec.execute("COMMIT;");
+    }
+
+    // Save snapshot but DO NOT truncate WAL — this is the bug scenario.
+    save_snapshot(&db_path, &db).expect("save updated");
+
+    // init_wal should fail because WAL still has the old initial_state.
+    let err = init_wal(&wal_path, &db);
+    assert!(err.is_err(), "init_wal must fail when WAL is stale");
+}
+
+// --- Bug #3 regression test: uncommitted keymap not persisted ---
+
+#[test]
+fn uncommitted_insert_keymap_not_persisted() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let db_path = std::env::temp_dir().join(format!("nucleusdb_phantom_bug3_{stamp}.redb"));
+
+    // Create and save initial empty db.
+    let mut db = NucleusDb::new(State::new(vec![]), VcBackend::BinaryMerkle, mk_cfg());
+    save_snapshot(&db_path, &db).expect("save initial");
+
+    // INSERT without COMMIT — keymap is mutated in memory.
+    {
+        let mut exec = SqlExecutor::new(&mut db);
+        exec.execute("INSERT INTO data (key, value) VALUES ('phantom', 777);");
+        assert!(!exec.committed());
+    }
+    // The in-memory keymap has the phantom key, but we do NOT persist
+    // because committed() is false (this is what the application layer does).
+
+    // Load from the persisted snapshot — phantom key must not exist.
+    let recovered = NucleusDb::load_persistent(&db_path, mk_cfg()).expect("load");
+    assert!(
+        recovered.keymap.get("phantom").is_none(),
+        "uncommitted key must not appear in persisted snapshot"
+    );
+}

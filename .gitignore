@@ -1,0 +1,37 @@
+/target/
+
+# Runtime artifacts
+/artifacts/*.redb
+/artifacts/*.wal
+/artifacts/**/*.jsonl
+/artifacts/**/*.tmp
+
+# Keep deterministic setup fixture tracked
+!/artifacts/
+!/artifacts/.gitkeep
+!/artifacts/kzg/
+!/artifacts/kzg/demo-trusted-setup-v1.json
+
+# Lean build artifacts
+/.lake/
+
+# Database files (stray test outputs)
+*.ndb
+*.wal
+*.redb
+--db
+--db.wal
+
+# WIP / internal development notes
+/WIP/
+
+# Internal ops accounting (not for public release)
+/Docs/ops/
+/Docs/integration/
+
+# Sidecar dependencies
+/wdk-sidecar/node_modules/
+
+# OS
+.DS_Store
+Thumbs.db

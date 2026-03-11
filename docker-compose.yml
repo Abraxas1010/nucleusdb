@@ -1,0 +1,20 @@
+services:
+  nucleusdb:
+    build: .
+    env_file: deploy/discord.env
+    volumes:
+      - nucleusdb-data:/data
+    ports:
+      - "${MCP_PORT:-3000}:3000"
+      - "${DASHBOARD_PORT:-3100}:3100"
+      - "${API_PORT:-8088}:8088"
+    restart: always
+    read_only: true
+    tmpfs:
+      - /tmp:size=50M
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+volumes:
+  nucleusdb-data:
