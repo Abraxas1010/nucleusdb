@@ -32,6 +32,11 @@
 # Sidecar dependencies
 /wdk-sidecar/node_modules/
 
+# Credentials (NEVER commit)
+deploy/discord.env
+*.env
+!deploy/discord.env.example
+
 # OS
 .DS_Store
 Thumbs.db
